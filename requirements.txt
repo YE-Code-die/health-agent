@@ -1,0 +1,10 @@
+langchain
+langchain-community
+transformers
+torch
+flask
+faiss-cpu
+sentence-transformers
+numpy
+tqdm
+requests 

@@ -1,15 +1,15 @@
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain.chains import RetrievalQA
-from langchain_community.llms import HuggingFaceHub  # or other LLM
-from langchain_core.documents import Document
-from langchain_community.llms import LlamaCpp  # For local models
-import requests  # For Ollama API
-from langchain_community.llms import HuggingFacePipeline  # Use community version
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
-from langchain.prompts import PromptTemplate  # Add PromptTemplate import
 import os
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores.faiss import FAISS
+from langchain_community.llms import HuggingFacePipeline
+from langchain.prompts import PromptTemplate
+from langchain.chains import RetrievalQA
 import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+import requests
+from langchain_community.llms import LlamaCpp
+from langchain_community.chat_models import ChatOllama
+from langchain_community.llms import HuggingFaceHub
 
 def load_vectorstore():
     # Assuming you have previously saved to the local_db folder
@@ -50,16 +50,16 @@ def get_local_llm(model_type="huggingface", model_path=None):
         return LlamaCpp(
             model_path=model_path,  # e.g., "models/deepseek-llm-7b-chat.gguf"
             temperature=0.7,  # Increased temperature for more creative responses
-            max_tokens=2048,  # Increased max tokens for longer responses
+            max_tokens=1024,  # Reduced max tokens for faster generation
             n_ctx=2048,
             verbose=True
         )
     elif model_type == "ollama":
         # Use Ollama API
-        return OllamaAPI(model="llama2", temperature=0.7)
+        return ChatOllama(model="llama2", temperature=0.7)
     elif model_type == "huggingface":
         # Use HuggingFace local model
-        model_id = model_path or "facebook/opt-125m"  # Use small causal model
+        model_id = model_path or "facebook/opt-125m"  # Use smaller model for faster response
         
         # Create model cache directory
         cache_dir = os.path.join(os.getcwd(), "model_cache")
