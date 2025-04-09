@@ -5,16 +5,18 @@ from langchain_community.llms import HuggingFaceHub  # or other LLM
 from langchain_core.documents import Document
 from langchain_community.llms import LlamaCpp  # For local models
 import requests  # For Ollama API
-from langchain_community.llms import HuggingFacePipeline  # For local HuggingFace models
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, pipeline
+from langchain_community.llms import HuggingFacePipeline  # Use community version
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from langchain.prompts import PromptTemplate  # Add PromptTemplate import
 import os
+import torch
 
 def load_vectorstore():
-    # 假设你之前已保存到 local_db 文件夹
+    # Assuming you have previously saved to the local_db folder
     return FAISS.load_local(
         folder_path="vector_db",
         embeddings=HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2"),
-        allow_dangerous_deserialization=True  # ✅ 显式允许 pickle 加载
+        allow_dangerous_deserialization=True  # ✅ Explicitly allow pickle loading
     )
 
 class OllamaAPI:
@@ -37,76 +39,150 @@ class OllamaAPI:
 
 def get_local_llm(model_type="huggingface", model_path=None):
     """
-    获取本地部署的LLM模型
+    Get locally deployed LLM model
     
-    参数:
-        model_type: 模型类型，可选 "llama", "ollama", "huggingface"
-        model_path: 模型路径，对于本地模型需要指定
+    Parameters:
+        model_type: Model type, options include "llama", "ollama", "huggingface"
+        model_path: Model path, required for local models
     """
     if model_type == "llama":
-        # 使用LlamaCpp加载本地模型
+        # Use LlamaCpp to load local model
         return LlamaCpp(
-            model_path=model_path,  # 例如: "models/deepseek-llm-7b-chat.gguf"
-            temperature=0.2,
-            max_tokens=512,
+            model_path=model_path,  # e.g., "models/deepseek-llm-7b-chat.gguf"
+            temperature=0.7,  # Increased temperature for more creative responses
+            max_tokens=2048,  # Increased max tokens for longer responses
             n_ctx=2048,
             verbose=True
         )
     elif model_type == "ollama":
-        # 使用Ollama API
-        return OllamaAPI(model="llama2", temperature=0.2)
+        # Use Ollama API
+        return OllamaAPI(model="llama2", temperature=0.7)
     elif model_type == "huggingface":
-        # 使用HuggingFace本地模型
-        model_id = model_path or "google/flan-t5-base"  # 使用更小的模型
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        # Use HuggingFace local model
+        model_id = model_path or "facebook/opt-125m"  # Use small causal model
         
-        # 创建模型缓存目录
+        # Create model cache directory
         cache_dir = os.path.join(os.getcwd(), "model_cache")
         os.makedirs(cache_dir, exist_ok=True)
         
-        model = AutoModelForSeq2SeqLM.from_pretrained(
+        # Check if GPU is available
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Using device: {device}")
+        
+        # Load tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(model_id, cache_dir=cache_dir)
+        
+        # Load model, without 8-bit quantization to avoid bitsandbytes issues
+        model = AutoModelForCausalLM.from_pretrained(
             model_id,
             device_map="auto",
             trust_remote_code=True,
-            offload_folder=cache_dir  # 指定权重卸载文件夹
+            offload_folder=cache_dir,  # Specify weight offload folder
+            torch_dtype=torch.float16  # Use half precision
         )
+        
+        # Create pipeline with improved generation parameters
         pipe = pipeline(
-            "text2text-generation",
+            "text-generation",
             model=model,
             tokenizer=tokenizer,
-            max_length=512,
-            temperature=0.2
+            max_length=2048,  # Increased max length
+            temperature=0.7,  # Increased temperature
+            do_sample=True,
+            top_p=0.95,
+            top_k=50,
+            repetition_penalty=1.2,
+            num_return_sequences=1,
+            pad_token_id=tokenizer.eos_token_id,
+            truncation=True,  # Enable truncation
+            return_full_text=False  # Don't return the prompt in the output
         )
         return HuggingFacePipeline(pipeline=pipe)
     else:
-        # 默认使用HuggingFaceHub
+        # Default to HuggingFaceHub
         return HuggingFaceHub(
             repo_id="google/flan-t5-base",
-            model_kwargs={"temperature": 0.2, "max_length": 512}
+            model_kwargs={"temperature": 0.7, "max_length": 2048}
         )
 
 def ask_question(query: str, model_type="huggingface", model_path=None):
     db = load_vectorstore()
 
-    # 获取本地LLM
+    # Get local LLM
     llm = get_local_llm(model_type=model_type, model_path=model_path)
 
-    qa_chain = RetrievalQA.from_chain_type(llm=llm, retriever=db.as_retriever())
-    answer = qa_chain.invoke(query)["result"]  # 使用invoke替代run
+    # Use custom prompt template to guide model to generate more natural responses
+    prompt_template = PromptTemplate(
+        template="""You are a professional medical assistant. Based on the following medical information, provide a clear and direct answer to the user's question. 
+        Focus on practical steps and specific recommendations. If the information is insufficient, clearly state what additional information would be helpful.
+
+        Medical Information:
+        {context}
+
+        User Question: {question}
+
+        Provide a direct and helpful response:""",
+        input_variables=["context", "question"]
+    )
+    
+    # Create QA chain with custom prompt
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=llm, 
+        retriever=db.as_retriever(),
+        chain_type="stuff",
+        return_source_documents=True,
+        chain_type_kwargs={
+            "prompt": prompt_template
+        }
+    )
+    
+    # Get answer and source documents
+    result = qa_chain.invoke(query)
+    answer = result["result"]
+    
+    # Clean up the response
+    answer = answer.replace("You are a professional medical assistant.", "").strip()
+    answer = answer.replace("Medical Information:", "").strip()
+    answer = answer.replace("User Question:", "").strip()
+    answer = answer.replace("Provide a direct and helpful response:", "").strip()
+    
+    # Remove any retrieved information that might be in the response
+    answer_lines = answer.split('\n')
+    cleaned_lines = []
+    for line in answer_lines:
+        # Skip lines containing common unwanted content
+        if any(marker in line for marker in [
+            'Q:', 'A:', 'NIH:', 'Context:', 'Medical Information:', 
+            'Based on the following', 'Note:', 'Question Title:',
+            'Answer Text:', 'Name:', 'Email Address:', 'Comment:',
+            'Please make sure', 'If you choose', 'We welcome',
+            'Your name is required', 'will NOT be published'
+        ]):
+            continue
+        # Skip empty lines and lines that are just formatting
+        if line.strip() and not line.strip().startswith('*') and not line.strip().startswith('('):
+            cleaned_lines.append(line)
+    
+    answer = '\n'.join(cleaned_lines).strip()
+    
+    # Ensure the response is not too short and contains actual advice
+    if len(answer.strip()) < 100:  # If response is too short
+        answer = "I apologize, but I need more information to provide a helpful response. Could you please provide more details about your question?"
+    
     return answer
 
 if __name__ == "__main__":
-    # 设置模型类型和路径
-    MODEL_TYPE = "huggingface"  # 改为huggingface，因为Ollama需要先拉取模型
-    MODEL_PATH = "google/flan-t5-base"  # 使用更小的模型
+    # Set model type and path
+    MODEL_TYPE = "huggingface"  # Changed to huggingface as Ollama requires model pulling first
+    MODEL_PATH = "facebook/opt-1.3b"  # Use larger causal model
     
-    print(f"使用模型类型: {MODEL_TYPE}")
+    print(f"Using model type: {MODEL_TYPE}")
     if MODEL_PATH:
-        print(f"模型路径: {MODEL_PATH}")
+        print(f"Model path: {MODEL_PATH}")
     
     while True:
-        question = input("❓ 请输入你的问题（输入 exit 退出）：\n> ")
+        question = input("❓ Please enter your question (type 'exit' to quit):\n> ")
         if question.lower() in {"exit", "quit"}:
             break
         answer = ask_question(question, model_type=MODEL_TYPE, model_path=MODEL_PATH)
-        print(f"\n💬 回答：{answer}\n")
+        print(f"\n💬 {answer}\n")
